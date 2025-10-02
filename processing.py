@@ -1,101 +1,142 @@
+from typing import Dict, List, Tuple, Any
 import numpy as np
-import matplotlib.pyplot as plt
-from typing import Tuple, Dict, List
-from numpy.lib.stride_tricks import sliding_window_view
-from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
-
-STATE_LABELS: Dict[int, str] = {
-    1: "Норма",
-    2: "Умеренная брадикардия",
-    3: "Тяжелая брадикардия",
-    4: "Умеренная тахикардия",
-    5: "Тяжелая тахикардия",
-}
-STATE_COLORS: Dict[int, str] = {
-    1: "#2ecc71",
-    2: "#3498db",
-    3: "#0b3c5d",
-    4: "#f39c12",
-    5: "#e74c3c",
-}
-BG_ACCEL = "#F5C2C7"
-BG_DECEL = "#AED6F1"
-BG_DECEL_LONG = "#85C1E9"
-def _resample_to_len(x: np.ndarray, target_len: int) -> np.ndarray:
-    """Линейно приводит x к длине target_len (если уже совпадает — возвращает как есть)."""
-    x = np.asarray(x, float).ravel()
-    if x.size == target_len:
-        return x
-    if target_len <= 0 or x.size == 0:
-        return np.zeros(max(0, target_len), dtype=float)
-    src = np.arange(x.size, dtype=float)
-    dst = np.linspace(0, x.size - 1, target_len, dtype=float)
-    return np.interp(dst, src, x)
-def _moving_avg(x: np.ndarray, win_samples: int) -> np.ndarray:
-    if win_samples < 1:
-        return x.copy()
-    k = np.ones(win_samples, float)
-    s = np.convolve(x, k, "same")
-    c = np.convolve(np.ones_like(x), k, "same")
-    return s / np.maximum(c, 1e-9)
-
-def _rolling_median(x: np.ndarray, win_samples: int) -> np.ndarray:
-    w = int(max(1, win_samples))
-    if w == 1 or x.size < w:
-        return x.copy()
-    sw = sliding_window_view(x, w)
-    med = np.median(sw, axis=-1)
-    pad_left = w // 2
-    pad_right = w - 1 - pad_left
-    return np.pad(med, (pad_left, pad_right), mode="edge")
-
-def _rolling_quantile(x: np.ndarray, win_samples: int, quantile: float) -> np.ndarray:
-    """Скользящий квантиль для расчета базального тонуса матки."""
-    w = int(max(1, win_samples))
-    if w == 1 or x.size < w:
-        return x.copy()
-    sw = sliding_window_view(x, w)
-    quant = np.quantile(sw, quantile, axis=-1)
-    pad_left = w // 2
-    pad_right = w - 1 - pad_left
-    return np.pad(quant, (pad_left, pad_right), mode="edge")
-
-def _moving_median(x: np.ndarray, win_samples: int) -> np.ndarray:
-    """Алиас для _rolling_median для совместимости."""
-    return _rolling_median(x, win_samples)
-
-def _hampel(y: np.ndarray, win_samples: int = 21, n_sigmas: float = 3.0) -> np.ndarray:
-    w = int(max(3, win_samples | 1))  # нечётное
-    if y.size < w:
-        return y.copy()
-    sw = sliding_window_view(y, w)
-    med = np.median(sw, axis=-1)
-    mad = np.median(np.abs(sw - med[..., None]), axis=-1)
-    sigma = 1.4826 * mad
-    pad_left = w // 2
-    pad_right = w - 1 - pad_left
-    med = np.pad(med, (pad_left, pad_right), mode="edge")
-    sigma = np.pad(sigma, (pad_left, pad_right), mode="edge")
-    out = y.copy()
-    mask = np.abs(out - med) > n_sigmas * (sigma + 1e-9)
-    out[mask] = med[mask]
-    return out
+import pandas as pd
 
 def _interp_nans(x: np.ndarray) -> np.ndarray:
     y = x.astype(float).copy()
-    n = len(y)
+    n = y.size
     if n == 0:
         return y
     mask = np.isnan(y)
     if not mask.any():
         return y
-    good = ~mask
-    if good.sum() == 0:
-        raise ValueError("Весь ряд состоит из NaN.")
-    idx = np.arange(n)
-    y[mask] = np.interp(idx[mask], idx[good], y[good])
+    idx = np.arange(n, dtype=float)
+    y[mask] = np.interp(idx[mask], idx[~mask], y[~mask])
     return y
+
+def _moving_avg(x: np.ndarray, w: int) -> np.ndarray:
+    x = np.asarray(x, dtype=float).ravel()
+    if w <= 1:
+        return x.copy()
+    k = np.ones(w, float)
+    s = np.convolve(x, k, "same")
+    c = np.convolve(np.ones_like(x), k, "same")
+    return s / np.maximum(c, 1e-9)
+
+
+def _rolling_median(x: np.ndarray, w: int) -> np.ndarray:
+    x = np.asarray(x, dtype=float).ravel() 
+    w = max(1, int(w))
+    if w == 1 or x.size < w:
+        return x.copy()
+    from numpy.lib.stride_tricks import sliding_window_view
+    sw = sliding_window_view(x, w)
+    med = np.median(sw, axis=-1)
+    pad_l = w // 2
+    pad_r = w - 1 - pad_l
+    return np.pad(med, (pad_l, pad_r), mode="edge")
+
+def _hampel(x: np.ndarray, w: int, n_sigmas: float = 3.0) -> np.ndarray:
+    """
+    Классический Hampel: заменяет выбросы на локальную медиану.
+    w — нечётное окно в пробах.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    w = max(3, int(w) | 1) 
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    sw = sliding_window_view(x, w) 
+    med = np.median(sw, axis=-1)
+    mad = np.median(np.abs(sw - med[:, None]), axis=-1)  
+
+    pad_l = w // 2
+    pad_r = w - 1 - pad_l
+    med_f = np.pad(med, (pad_l, pad_r), mode="edge")
+    mad_f = np.pad(mad, (pad_l, pad_r), mode="edge")
+
+    thresh = n_sigmas * 1.4826 * np.maximum(mad_f, 1e-9)
+
+    y = x.copy()
+    outliers = np.abs(y - med_f) > thresh
+    y[outliers] = med_f[outliers]
+    return y
+
+def _fhr_event_status(delta: float, enter: float = 12.0) -> int:
+    if delta >= enter: return 1
+    if delta <= -enter: return -1
+    return 0
+
+def _toco_line_band(intensity: float) -> int:
+    if intensity > 80.0: return 2
+    if intensity >= 30.0: return 1
+    return 0
+
+def _classify_fhr_states(
+    fhr: np.ndarray,
+    fs: float,
+    *,
+    smooth_seconds: float = 5.0,
+    hampel_seconds: float = 3.0,
+    sustain_seconds: float = 600.0,
+    event_baseline_seconds: float = 600.0,
+    severe_brady_threshold: float = 100.0,
+    brady_threshold: float = 120.0,
+    tachy_threshold: float = 160.0,
+    severe_tachy_threshold: float = 180.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Возвращает:
+      states         — коды 1..5 (как в processing.py)
+      baseline_event — локальная базальная линия для событий (скользящая медиана)
+      x_smooth       — сглаженный и «очищенный» ряд (для последующей детекции событий)
+    """
+    x = _interp_nans(np.asarray(fhr, dtype=float).ravel())
+
+    # сглаживание + Hampel (как в processing.py)
+    smooth_win = max(1, int(round(fs * smooth_seconds)))
+    x_smooth = _moving_avg(x, smooth_win)
+    x_smooth = _hampel(x_smooth, max(3, int(round(fs * hampel_seconds)) | 1))
+
+    # «устойчивая» база для КЛАССИФИКАЦИИ состояний
+    sustain_win = max(1, int(round(fs * sustain_seconds)))
+    baseline_state = _moving_avg(x_smooth, sustain_win)
+
+    # состояния 1..5 (точно как во втором файле)
+    states = np.full_like(x, 0, dtype=int)
+
+    mask1 = (baseline_state < brady_threshold)
+    mask2 = (baseline_state < severe_brady_threshold)
+    mask3 = (baseline_state > tachy_threshold)
+    mask4 = (baseline_state > severe_tachy_threshold)
+
+    min_len = min(len(states), len(mask1))
+    states = states[:min_len]
+
+    if len(mask1) != min_len: mask1 = mask1[:min_len]
+    if len(mask2) != min_len: mask2 = mask2[:min_len]
+    if len(mask3) != min_len: mask3 = mask3[:min_len]
+    if len(mask4) != min_len: mask4 = mask4[:min_len]
+
+    states[mask1] = -1
+    states[mask2] = -2
+    states[mask3] = 1
+    states[mask4] = 2
+
+    ev_win = max(1, int(round(fs * event_baseline_seconds)))
+    baseline_event = _rolling_median(x_smooth, ev_win)
+
+    n = x.size
+    if baseline_event.size != n:
+        baseline_event = baseline_event[:n]
+    if states.size != n:
+        states = states[:n]
+    if x_smooth.size != n:
+        x_smooth = x_smooth[:n]
+
+    return states, baseline_event, x_smooth
+def _align_len(*arrs: np.ndarray) -> Tuple[np.ndarray, ...]:
+    m = min(len(a) for a in arrs)
+    return tuple(a[:m] for a in arrs)
 
 def _segments_from_mask(mask: np.ndarray) -> List[tuple]:
     diff = np.diff(mask.astype(np.int8), prepend=0, append=0)
@@ -110,7 +151,7 @@ def _merge_segments(segs: List[tuple], max_gap: int) -> List[tuple]:
     res = [segs[0]]
     for s, e in segs[1:]:
         ps, pe = res[-1]
-        if s - pe <= max_gap:     # сливаем через короткий разрыв
+        if s - pe <= max_gap:
             res[-1] = (ps, max(pe, e))
         else:
             res.append((s, e))
@@ -123,16 +164,12 @@ def _filter_by_len_and_peak(delta: np.ndarray, segs: List[tuple],
         if e - s < min_len:
             continue
         seg = delta[s:e]
-        if kind == "accel":
-            peak = np.max(seg)
-        else:
-            peak = -np.min(seg)
+        peak = np.max(seg) if kind == "accel" else -np.min(seg)
         if peak >= min_peak:
             out.append((s, e))
     return out
 
 def _hysteresis_mask(delta: np.ndarray, enter_thr: float, exit_thr: float, sign: int) -> np.ndarray:
-    """sign=+1 для акцелераций, -1 для децелераций."""
     assert sign in (+1, -1)
     x = sign * delta
     m = np.zeros_like(x, dtype=bool)
@@ -147,112 +184,186 @@ def _hysteresis_mask(delta: np.ndarray, enter_thr: float, exit_thr: float, sign:
     return m
 
 
+def _analyze_toco(uterus: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Вычисляем:
+      intensity (excess >= 0)
+      тахисистолия/гипертонус/тетания (простая эвристика)
+    """
+    x = _interp_nans(uterus)
+    xs = _moving_avg(x, max(1, int(round(fs * 3.0))))
+    tone = _rolling_median(xs, max(1, int(round(fs * 75.0))))
+    excess = np.maximum(xs - tone, 0.0)
 
+    on = excess >= 10.0
+    segs = []
+    cur = None
+    for i, v in enumerate(on):
+        if v and cur is None:
+            cur = i
+        if (not v or i == on.size - 1) and cur is not None:
+            j = i if not v else i + 1
+            if (j - cur) / fs >= 120.0:
+                segs.append((cur, j))
+            cur = None
 
-def classify_and_plot_fhr(
-    fhr_bpm: np.ndarray,
-    fs: float = 7.87,
-    class_name: str = '',
-    *,
-    # — базовая классификация по устойчивой базе (как было)
-    brady_threshold: float = 120.0,
-    tachy_threshold: float = 160.0,
-    severe_brady_threshold: float = 100.0,
-    severe_tachy_threshold: float = 180.0,
-    sustain_seconds: float = 600.0,
-    smooth_seconds: float = 5.0,
-    chunk_minutes: float = 20.0,
-    show: bool = True,
-    # — улучшенная детекция событий
-    event_baseline_seconds: float = 90.0,   # локальная база (скользящая медиана)
-    hampel_seconds: float = 3.0,            # подавление выбросов
-    accel_enter: float = 12.0, accel_exit: float = 8.0,
-    decel_enter: float = 12.0, decel_exit: float = 8.0,
-    accel_min_seconds: float = 15.0, decel_min_seconds: float = 15.0,
-    accel_min_peak: float = 15.0, decel_min_depth: float = 15.0,
-    merge_gap_seconds: float = 5.0,
-    prolonged_decel_seconds: float = 120.0,
-    very_prolonged_decel_seconds: float = 300.0,
-    bg_alpha: float = 0.28,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+    n = x.size
+    alert_tet = np.zeros(n, dtype=int)
+    for s, e in segs:
+        alert_tet[s:e] = 1
 
-    x = np.asarray(fhr_bpm, float).ravel()
-    if x.size == 0:
-        raise ValueError("Пустой временной ряд ЧСС.")
-    x = _interp_nans(x)
+    L = int(round(600.0 * fs))
+    S = int(round(60.0 * fs))
+    starts = list(range(0, max(1, n - L + 1), S)) or [0]
 
-    # мягкое сглаживание + удаление выбросов
-    smooth_win = max(1, int(round(fs * smooth_seconds)))
-    x_smooth = _moving_avg(x, smooth_win)
-    x_smooth = _hampel(x_smooth, max(3, int(fs * hampel_seconds) | 1))
+    peaks = (excess[1:-1] > excess[:-2]) & (excess[1:-1] >= excess[2:]) & (excess[1:-1] >= 10.0)
+    peak_idx = np.flatnonzero(peaks) + 1
 
-    # базальная линия для КЛАССИФИКАЦИИ (длинная)
-    sustain_win = max(1, int(round(fs * sustain_seconds)))
-    baseline_state = _moving_avg(x_smooth, sustain_win)
+    alert_tachy = np.zeros(n, dtype=int)
+    alert_hyper = np.zeros(n, dtype=int)
+    for s0 in starts:
+        e0 = min(n, s0 + L)
 
-    # >>> ПРЕДОХРАНИТЕЛЬ от рассинхрона <<<
-    baseline_state = _resample_to_len(baseline_state, x.size)
+        cnt = int(np.sum((peak_idx >= s0) & (peak_idx < e0)))
+        if cnt > 5:
+            alert_tachy[s0:e0] = 1
 
-    # состояния
-    states = np.full_like(x, 1, dtype=int)
-    states[baseline_state < brady_threshold] = 2
-    states[baseline_state < severe_brady_threshold] = 3
-    states[baseline_state > tachy_threshold] = 4
-    states[baseline_state > severe_tachy_threshold] = 5
+        if e0 > s0 and float(np.median(tone[s0:e0])) > 25.0:
+            alert_hyper[s0:e0] = 1
 
-    # базальная линия для СОБЫТИЙ (локальная, робастная)
-    ev_win = max(1, int(round(fs * event_baseline_seconds)))
-    baseline_event = _rolling_median(x_smooth, ev_win)
+    intensity = excess * 1.0
+    return intensity, alert_tachy, alert_hyper | alert_tet 
 
-    # >>> и тут — для симметрии/надёжности <<<
-    baseline_event = _resample_to_len(baseline_event, x.size)
-    delta = x_smooth - baseline_event
+STATE_LABELS: Dict[int, str] = {
+    0: "Норма",
+    -1: "Умеренная брадикардия",
+    -2: "Тяжелая брадикардия",
+    1: "Умеренная тахикардия",
+    2: "Тяжелая тахикардия",
+}
 
-    # гистерезисные маски
-    accel_mask0 = _hysteresis_mask(delta, accel_enter, accel_exit, sign=+1)
-    decel_mask0 = _hysteresis_mask(delta, decel_enter, decel_exit, sign=-1)
+def compute_signals_and_statuses(
+    bpm_df: pd.DataFrame,
+    uterus_df: pd.DataFrame,
+    fs: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any], List[str]]:
+    """
+    Выравнивает длины входов/промежуточных рядов, считает статусы на КАЖДОЙ точке.
+    Возвращает:
+      time_s, fhr, uterus,
+      statuses: dict (линии статусов + события + коды состояний -2..2 + СТАТИСТИКА),
+      warnings_sorted: List[str]
+    """
 
-    # слияние через короткие разрывы
-    merge_gap = int(round(fs * merge_gap_seconds))
+    def _align_len(*arrs: np.ndarray) -> Tuple[np.ndarray, ...]:
+        if not arrs:
+            return tuple()
+        m = min(len(a) for a in arrs)
+        return tuple(a[:m] for a in arrs)
+
+    n0 = min(len(bpm_df), len(uterus_df))
+    if n0 <= 0:
+        empty_f = np.array([], dtype=float)
+        empty_i = np.array([], dtype=int)
+        statistics = {STATE_LABELS[k]: 0.0 for k in STATE_LABELS}
+        statistics["Всего, сек"] = 0.0
+        statuses = {
+            "fhr_line_status": empty_i,
+            "fhr_event_status": empty_i,
+            "fhr_states": empty_i,
+            "toco_line_status": empty_i,
+            "toco_tachysystole": empty_i,
+            "toco_hypertonus": empty_i,
+            "toco_tetanic": empty_i,
+            "fhr_statistics": statistics,
+            "baseline_event": empty_f,
+        }
+        return empty_f, empty_f, empty_f, statuses, ["Нет данных"]
+
+    bpm_df = bpm_df.iloc[:n0].reset_index(drop=True)
+    uterus_df = uterus_df.iloc[:n0].reset_index(drop=True)
+
+    time_s = bpm_df["time_sec"].values.astype(float, copy=False)
+    fhr = bpm_df["value"].values.astype(float, copy=False)
+    uterus = uterus_df["value"].values.astype(float, copy=False)
+
+    states, baseline_ev, x_smooth = _classify_fhr_states(fhr, fs)
+
+    time_s, fhr, uterus = _align_len(time_s, fhr, uterus)
+    states, baseline_ev, x_smooth = _align_len(states, baseline_ev, x_smooth)
+    n = min(len(time_s), len(fhr), len(uterus), len(states), len(baseline_ev), len(x_smooth))
+    time_s, fhr, uterus, states, baseline_ev, x_smooth = (
+        time_s[:n], fhr[:n], uterus[:n], states[:n], baseline_ev[:n], x_smooth[:n]
+    )
+
+    fhr_line = states.astype(int, copy=False)
+
+    delta = x_smooth - baseline_ev
+    accel_mask0 = _hysteresis_mask(delta, enter_thr=12.0, exit_thr=8.0, sign=+1)
+    decel_mask0 = _hysteresis_mask(delta, enter_thr=12.0, exit_thr=8.0, sign=-1)
+
+    merge_gap = int(round(fs * 5.0))
     accel_segs = _merge_segments(_segments_from_mask(accel_mask0), merge_gap)
     decel_segs = _merge_segments(_segments_from_mask(decel_mask0), merge_gap)
 
-    # финальная фильтрация по длительности и реальному пику
-    min_len_acc = int(round(fs * accel_min_seconds))
-    min_len_dec = int(round(fs * decel_min_seconds))
-    accel_segs = _filter_by_len_and_peak(delta, accel_segs, min_len_acc, accel_min_peak, "accel")
-    decel_segs = _filter_by_len_and_peak(delta, decel_segs, min_len_dec, decel_min_depth, "decel")
+    min_len_acc = int(round(fs * 15.0))
+    min_len_dec = int(round(fs * 15.0))
+    accel_segs = _filter_by_len_and_peak(delta, accel_segs, min_len_acc, 15.0, "accel")
+    decel_segs = _filter_by_len_and_peak(delta, decel_segs, min_len_dec, 15.0, "decel")
 
-    # длительные децелерации
-    durs_dec = [(e - s) / fs for s, e in decel_segs]
-    decel_long = [seg for seg, d in zip(decel_segs, durs_dec) if d > prolonged_decel_seconds]
-    decel_very_long = [seg for seg, d in zip(decel_segs, durs_dec) if d >= very_prolonged_decel_seconds]
+    fhr_evt = np.zeros(n, dtype=int)
+    for s, e in accel_segs:
+        s0, e0 = max(0, int(s)), min(n, int(e))
+        if e0 > s0:
+            fhr_evt[s0:e0] = 1
+    for s, e in decel_segs:
+        s0, e0 = max(0, int(s)), min(n, int(e))
+        if e0 > s0:
+            fhr_evt[s0:e0] = -1
 
-    # статистика
-    n = x.size
+    intensity, alert_tachy, alert_hyper_or_tet = _analyze_toco(uterus, fs)
+    (intensity, alert_tachy, alert_hyper_or_tet) = _align_len(intensity, alert_tachy, alert_hyper_or_tet)
+    intensity = intensity[:n]; alert_tachy = alert_tachy[:n]; alert_hyper_or_tet = alert_hyper_or_tet[:n]
+
+    toco_line = np.array([_toco_line_band(float(v)) for v in intensity], dtype=int)
+    win = max(1, int(round(10 * fs)))
+    mean_int = _moving_avg(intensity, win)
+    if len(mean_int) != n:
+        mean_int = mean_int[:n]
+
+    toco_tet = np.zeros_like(toco_line, dtype=int)
+    toco_tet[(alert_hyper_or_tet == 1) & (mean_int > 40.0)] = 1
+    toco_hyper = np.clip(alert_hyper_or_tet - toco_tet, 0, 1)
+
     statistics: Dict[str, float] = {STATE_LABELS[s]: float(np.sum(states == s) / fs) for s in STATE_LABELS}
     statistics["Всего, сек"] = float(n / fs)
 
-    cp = np.flatnonzero(np.diff(states)) + 1
-    seg_starts = np.r_[0, cp]; seg_states = states[seg_starts]
-    for s in (2, 3, 4, 5):
-        statistics[f"Промежутки (шт) — {STATE_LABELS[s]}"] = float(int(np.sum(seg_states == s)))
-    statistics["Промежутки (шт) — Не норма (всего)"] = float(int(np.sum(seg_states != 1)))
+    if n > 0:
+        cp = np.flatnonzero(np.diff(states)) + 1
+        seg_starts = np.r_[0, cp]
+        seg_states = states[seg_starts]
+    else:
+        seg_states = np.array([], dtype=int)
 
-    def _dur(segs): return sum((e - s) for s, e in segs) / fs
-    def _amps(segs, kind):
-        vals = []
+    for s in (-2, -1, 1, 2):
+        statistics[f"Промежутки (шт) — {STATE_LABELS[s]}"] = float(int(np.sum(seg_states == s)))
+    statistics["Промежутки (шт) — Не норма (всего)"] = float(int(np.sum(seg_states != 0)))
+
+    def _dur(segs: List[tuple]) -> float:
+        return sum((e - s) for s, e in segs) / fs
+
+    def _amps(segs: List[tuple], kind: str) -> List[float]:
+        vals: List[float] = []
         for s, e in segs:
-            seg = delta[s:e]
+            s0, e0 = max(0, int(s)), min(n, int(e))
+            if e0 <= s0:
+                continue
+            seg = delta[s0:e0]
             vals.append(float(np.max(seg) if kind == "accel" else -np.min(seg)))
         return vals
 
-
-
-
-
-    acc_durs = [(e - s) / fs for s, e in accel_segs]
-    dec_durs = [(e - s) / fs for s, e in decel_segs]
+    acc_durs = [(min(n, e) - max(0, s)) / fs for s, e in accel_segs if min(n, e) > max(0, s)]
+    dec_durs = [(min(n, e) - max(0, s)) / fs for s, e in decel_segs if min(n, e) > max(0, s)]
     acc_amps = _amps(accel_segs, "accel")
     dec_deps = _amps(decel_segs, "decel")
 
@@ -267,288 +378,232 @@ def classify_and_plot_fhr(
         "Децелерации — медиана длительности, сек": float(np.median(dec_durs) if dec_durs else 0.0),
         "Децелерации — макс глубина, уд/мин": float(max(dec_deps) if dec_deps else 0.0),
 
-        "Децелерации — пролонгированные >2 мин (шт)": float(len(decel_long)),
-        "Децелерации — ≥5 мин (шт)": float(len(decel_very_long)),
+        "Децелерации — пролонгированные >2 мин (шт)": float(sum(d > 120.0 for d in dec_durs)),
+        "Децелерации — ≥5 мин (шт)": float(sum(d >= 300.0 for d in dec_durs)),
     })
 
-    # график
-    if show:
-        max_chunk = max(1, int(round(chunk_minutes * 60 * fs)))
-        t_abs_min = np.arange(n) / fs / 60.0
-        for chunk_idx, cs in enumerate(range(0, n, max_chunk)):
-            ce = min(n, cs + max_chunk)
-            t = (np.arange(cs, ce) - cs) / fs / 60.0 + chunk_minutes * chunk_idx
+    statuses: Dict[str, Any] = {
+        "fhr_line_status": fhr_line.astype(int, copy=False),
+        "fhr_event_status": fhr_evt.astype(int, copy=False),
+        "fhr_states": states.astype(int, copy=False),           
+        "toco_line_status": toco_line.astype(int, copy=False),   
+        "toco_tachysystole": alert_tachy.astype(int, copy=False),
+        "toco_hypertonus": toco_hyper.astype(int, copy=False),
+        "toco_tetanic": toco_tet.astype(int, copy=False),
+        "fhr_statistics": statistics,
+        "baseline_event": baseline_ev.astype(float, copy=False),
+    }
 
-            fig, ax = plt.subplots(figsize=(12, 5))
+    warnings_sorted = generate_warnings(
+        fhr=fhr, uterus=uterus, fs=fs,
+        fhr_line=fhr_line, fhr_event=fhr_evt,
+        toco_line=toco_line, toco_tachy=alert_tachy,
+        toco_hyper=toco_hyper, toco_tet=toco_tet
+    )
 
-            # фоновые спаны (поверх осевого фона)
-            def _draw(segs, color, alpha):
-                for s0, e0 in segs:
-                    s = max(s0, cs); e = min(e0, ce)
-                    if e <= s: continue
-                    t0 = (s - cs) / fs / 60.0 + chunk_minutes * chunk_idx
-                    t1 = (e - cs) / fs / 60.0 + chunk_minutes * chunk_idx
-                    ax.axvspan(t0, t1, color=color, alpha=alpha, zorder=1)
-
-            _draw(accel_segs, BG_ACCEL, bg_alpha)
-            _draw(decel_segs, BG_DECEL, bg_alpha * 0.95)
-            _draw(decel_long, BG_DECEL_LONG, min(bg_alpha + 0.05, 0.35))
-
-            # цветная линия по состояниям
-            change_points = np.flatnonzero(np.diff(states)) + 1
-            bounds = [cs] + [p for p in change_points if cs < p < ce] + [ce]
-            shown = set()
-            for a, b in zip(bounds[:-1], bounds[1:]):
-                st = states[a]; lab = None
-                if st != 1 and st not in shown:
-                    lab = STATE_LABELS[st]; shown.add(st)
-                ax.plot(t[(a - cs):(b - cs)], x[a:b], lw=1.8, color=STATE_COLORS[st], label=lab, zorder=2)
-
-            # базальная линия (для событий — более наглядная)
-            ax.plot(t, baseline_event[cs:ce], lw=1.0, ls="--", color="#7f8c8d",
-                    label=f"Базальная (локальная {int(event_baseline_seconds)} сек)", zorder=3)
-
-            for thr in (severe_brady_threshold, brady_threshold, tachy_threshold, severe_tachy_threshold):
-                ax.axhline(thr, ls=":", lw=1.0, color="#7f8c8d")
-
-            proxies = [
-                Patch(facecolor=BG_ACCEL, alpha=bg_alpha, label="Акцелерации"),
-                Patch(facecolor=BG_DECEL, alpha=bg_alpha*0.95, label="Децелерации"),
-                # Patch(facecolor=BG_DECEL_LONG, alpha=min(bg_alpha+0.05, 0.35), label="Децелерации >2 мин"),
-            ]
-
-            chunk_start = t_abs_min[cs]
-            chunk_end = t_abs_min[ce-1] if ce > cs else chunk_start
-            ax.set_title(f"ЧСС с устойчивостью ≥ {int(sustain_seconds)} сек. Диагноз: {class_name}")
-            ax.set_xlabel("Время, мин"); ax.set_ylabel("ЧСС, уд/мин")
-            leg1 = ax.legend(loc="upper right"); ax.add_artist(leg1)
-            ax.legend(handles=proxies, loc="upper left")
-            ax.grid(True, alpha=0.3)
-            plt.show()
-
-    return states, baseline_event, statistics
+    return time_s, fhr, uterus, statuses, warnings_sorted
 
 
-def analyze_and_plot_toco_demo(
-    toco_mmHg: np.ndarray,
-    fs: float,
+
+# ————————————————————————————————————————————————————————————————
+# Генератор предупреждений (только здесь!)
+# ————————————————————————————————————————————————————————————————
+
+def generate_warnings(
     *,
-    show: bool = True,
-    # сглаживание/тонус
-    smooth_seconds: float = 3.0,           # 3–5 с
-    smooth_kind: str = "mean",             # "mean" | "median"
-    tone_window_seconds: float = 75.0,     # 60–90 с
-    tone_quantile: float = 0.10,           # 10%
-    # схватки
-    amp_threshold_mmHg: float = 10.0,      # давление − тонус ≥ 10
-    min_duration_seconds: float = 30.0,    # минимум 30 с
-    end_below_seconds: float = 12.0,       # конец: ниже порога ≥10–15 с
-    # окна тревог
-    win_len_seconds: float = 600.0,        # 10 минут
-    win_step_seconds: float = 60.0,        # шаг 60 с
-    # отрисовка
-    chunk_minutes: float = 20.0,
-    alpha_bg: float = 0.28,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict], List[Dict], Dict[str, float]]:
+    fhr: np.ndarray,
+    uterus: np.ndarray,
+    fs: float,
+    fhr_line: np.ndarray,
+    fhr_event: np.ndarray,
+    toco_line: np.ndarray,
+    toco_tachy: np.ndarray,
+    toco_hyper: np.ndarray,
+    toco_tet: np.ndarray,
+) -> List[str]:
     """
-    DEMO: фон = только тревоги (тахисистолия/гипертонус), плашки = тетанические,
-    ЛИНИЯ окрашена по интенсивности (3 уровня).
-
-    Возвращает:
-      tone               — базальный тонус (мм рт. ст.), shape=(n,)
-      intensity_mmHg     — интенсивность схватки (excess>=0), мм рт. ст., shape=(n,)
-      alert_code         — код тревоги по времени: 0 ок, 1 тахисистолия, 2 гипертонус, 3 тетания, shape=(n,)
-      contractions       — список детектированных схваток
-      windows_alerts     — список окон тревог
-      stats_alerts       — сводка
+    Совместимо по сигнатуре, но логика — как в rules 6.1–6.5 из processing.py.
+    Итог — уникальные тексты WARNING/CRITICAL, отсортированные по важности.
     """
-    x = _interp_nans(toco_mmHg)
-    n = x.size
-    if n == 0:
-        raise ValueError("Пустая токограмма.")
+    import numpy as np
 
-    # сглаживание
-    w_sm = max(1, int(round(fs * smooth_seconds)))
-    xs = _moving_median(x, w_sm) if smooth_kind == "median" else _moving_avg(x, w_sm)
+    # --- FHR препроцессинг (ровно как во втором файле) ---
+    x = _interp_nans(np.asarray(fhr, float).ravel())
+    smooth_win = max(1, int(round(fs * 5.0)))
+    x_smooth = _moving_avg(x, smooth_win)
+    x_smooth = _hampel(x_smooth, max(3, int(round(fs * 3.0)) | 1))
 
-    # базальный тонус: нижний «конверт» (q10)
-    w_tone = max(1, int(round(fs * tone_window_seconds)))
-    tone = _rolling_quantile(xs, w_tone, tone_quantile)
+    ev_win = max(1, int(round(fs * 600.0)))
+    baseline_event = _rolling_median(x_smooth, ev_win)
+    delta = x_smooth - baseline_event
 
-    # превышение над тоном и непрерывная интенсивность
-    excess = xs - tone
-    intensity_mmHg = np.maximum(excess, 0.0)
+    # Децелерации: гистерезис → merge → фильтры (как в processing.py)
+    dec_mask0 = _hysteresis_mask(delta, enter_thr=12.0, exit_thr=8.0, sign=-1)
+    dec_segs = _merge_segments(_segments_from_mask(dec_mask0), int(round(fs * 5.0)))
+    dec_segs = _filter_by_len_and_peak(delta, dec_segs, int(round(fs * 15.0)), 15.0, "decel")
+    dec_segs_s = [(s / fs, e / fs) for s, e in dec_segs]
+    dec_long_warn = [(s, e) for (s, e) in dec_segs_s if (e - s) > 90.0]
+    dec_long_crit = [(s, e) for (s, e) in dec_segs_s if (e - s) >= 180.0]
 
-    # детекция схваток (с хвостом завершения)
-    thr = float(amp_threshold_mmHg)
-    min_len = int(round(fs * min_duration_seconds))
-    gap_close = int(round(fs * end_below_seconds))
+    # Устойчивые сегменты тяжёлой брадикардии ≥3 мин (6.1)
+    def _sustained(mask_func, min_s: float) -> List[tuple]:
+        m = mask_func(x_smooth)
+        out = []
+        for s, e in _segments_from_mask(m):
+            if (e - s) / fs >= min_s:
+                out.append((s / fs, e / fs))
+        return out
 
+    sev_brady_segs = _sustained(lambda v: v < 100.0, 180.0)
+    
+    # --- ТОКО: восстановим схватки и окна так же, как во втором файле ---
+    # Сгладим и отделим «тонус»
+    xs = _moving_avg(_interp_nans(np.asarray(uterus, float).ravel()),
+                     max(1, int(round(fs * 3.0))))
+    tone = _rolling_median(xs, max(1, int(round(fs * 75.0))))
+    excess = np.maximum(xs - tone, 0.0)
+
+    # Схватки: excess>=10 мм рт.ст., ≥30 с, «хвост» завершения 12 с
+    thr = 10.0
+    min_len = int(round(fs * 30.0))
+    gap_close = int(round(fs * 12.0))
     raw = _segments_from_mask(excess >= thr)
     merged = []
     if raw:
         cs, ce = raw[0]
         for s, e in raw[1:]:
-            if s - ce <= gap_close:
-                ce = e
-            else:
-                merged.append((cs, ce))
-                cs, ce = s, e
+            if s - ce <= gap_close: ce = e
+            else: merged.append((cs, ce)); cs, ce = s, e
         merged.append((cs, ce))
-    segs = [(s, e) for s, e in merged if (e - s) >= min_len]
+    contr = [(s, e) for s, e in merged if (e - s) >= min_len]
+    contr_s = np.array([s / fs for s, e in contr]) if contr else np.array([], float)
+    contr_e = np.array([e / fs for s, e in contr]) if contr else np.array([], float)
 
-    contractions: List[Dict] = []
-    peaks_idx = []
-    for s, e in segs:
-        seg_exc = excess[s:e]
-        if seg_exc.size == 0:
-            continue
-        loc = int(np.argmax(seg_exc))
-        p_idx = s + loc
-        peaks_idx.append(p_idx)
-        contractions.append({
-            "start_s": s / fs,
-            "end_s": e / fs,
-            "duration_s": (e - s) / fs,
-            "amp_mmHg": float(seg_exc[loc]),
-            "peak_s": p_idx / fs,
-            "peak_idx": int(p_idx),
-        })
-    peaks_idx = np.asarray(peaks_idx, int)
-
-    # окна тревог (только тахисистолия/гипертонус)
-    L = int(round(fs * win_len_seconds))
-    S = int(round(fs * win_step_seconds))
+    # Окна 10 мин, шаг 60 с → «тахисистолия» (>5 пиков) и «гипертонус» (median tone >25)
+    L = int(round(600.0 * fs)); S = int(round(60.0 * fs)); n = len(xs)
     starts = list(range(0, max(1, n - L + 1), S)) or [0]
+    # пики схваток (по excess)
+    peaks = (excess[1:-1] > excess[:-2]) & (excess[1:-1] >= excess[2:]) & (excess[1:-1] >= 10.0)
+    peak_idx = (np.flatnonzero(peaks) + 1).astype(int)
 
-    COLORS = {
-        "Тахисистолия": "#e74c3c",
-        "Гипертонус":   "#6e2c00",
-        "Тетания":      "#8e44ad",  # плашки схваток ≥120 с
-    }
-
-    windows_alerts: List[Dict] = []
+    windows = []
     for s0 in starts:
         e0 = min(n, s0 + L)
-        if peaks_idx.size:
-            n_cnt = int(np.count_nonzero((peaks_idx >= s0) & (peaks_idx < e0)))
-        else:
-            n_cnt = 0
+        cnt = int(np.sum((peak_idx >= s0) & (peak_idx < e0)))
         tone_med = float(np.median(tone[s0:e0])) if e0 > s0 else 0.0
+        lab = None
+        if cnt > 5: lab = "Тахисистолия"
+        elif tone_med > 25.0: lab = "Гипертонус"
+        windows.append((s0 / fs, e0 / fs, lab))
 
-        label, color, hatch = None, None, None
-        if n_cnt > 5:
-            label, color = "Тахисистолия", COLORS["Тахисистолия"]
-        elif tone_med > 25.0:
-            label, color, hatch = "Гипертонус", COLORS["Гипертонус"], "////"
+    # Тетания: схватки ≥120 с
+    tetanic = [(s / fs, e / fs) for s, e in contr if (e - s) / fs >= 120.0]
 
+    def _overlap(a0,a1,b0,b1): return (min(a1,b1) - max(a0,b0)) > 0.0
 
+    # Вспомогательные функции для правил 6.4–6.5
+    def ratio_decels_per_contr(t0: float, t1: float) -> float:
+        if contr_s.size == 0: return 0.0
+        idx = np.where((contr_s < t1) & (contr_e > t0))[0]
+        if idx.size == 0: return 0.0
+        coupled = 0
+        for k in idx:
+            c0, c1 = float(contr_s[k]), float(contr_e[k])
+            if any(_overlap(c0, c1, d0, d1) for (d0, d1) in dec_segs_s):
+                coupled += 1
+        return coupled / float(idx.size)
 
+    def tachysystole_recent(t: float, horizon_s: float = 1800.0) -> bool:
+        a0, a1 = max(0.0, t - horizon_s), t
+        return any((lab == "Тахисистолия") and _overlap(a0, a1, w0, w1)
+                   for (w0, w1, lab) in windows)
 
-        windows_alerts.append({
-            "start_s": s0 / fs, "end_s": e0 / fs,
-            "label": label, "color": color, "hatch": hatch,
-            "n": n_cnt, "tone_med": tone_med,
-        })
+    def hyper_overlap(t0: float, t1: float) -> bool:
+        return any((lab == "Гипертонус") and _overlap(t0, t1, w0, w1)
+                   for (w0, w1, lab) in windows)
 
-    # сводка тревог
-    total_sec = n / fs
-    n_win = len(windows_alerts) if windows_alerts else 1
-    tachy_cnt = sum(1 for w in windows_alerts if w["label"] == "Тахисистолия")
-    hyper_cnt = sum(1 for w in windows_alerts if w["label"] == "Гипертонус")
-    tetanic = [c for c in contractions if c["duration_s"] >= 120.0]
+    def no_recovery_between_contractions(t0: float, t1: float) -> bool:
+        if contr_s.size < 2: return False
+        idx = np.where((contr_s >= t0) & (contr_e <= t1))[0]
+        if idx.size < 2: return False
+        for i in range(idx.size - 1):
+            e1 = contr_e[idx[i]]; s2 = contr_s[idx[i+1]]
+            lo = int(max(0, np.floor(e1 * fs))); hi = int(min(len(x_smooth), np.ceil(s2 * fs)))
+            if hi > lo and np.min(x_smooth[lo:hi]) < 120.0:
+                return True
+            for (d0, d1) in dec_segs_s:
+                if _overlap(e1, s2, d0, d1): return True
+        return False
 
-    stats_alerts: Dict[str, float] = {
-        "Длительность записи, мин": float(total_sec / 60.0),
-        "Тахисистолия — окна (шт)": float(tachy_cnt),
-        "Тахисистолия — окна (%)": float(100.0 * tachy_cnt / n_win),
-        "Гипертонус — окна (шт)": float(hyper_cnt),
-        "Гипертонус — окна (%)": float(100.0 * hyper_cnt / n_win),
-        "Тетанические — эпизоды (шт)": float(len(tetanic)),
-        "Тетанические — макс длительность, с": float(max([c["duration_s"] for c in tetanic]) if tetanic else 0.0),
-    }
+    # --- Правила 6.1–6.5 → тексты ---
+    texts: list[tuple[int, str]] = []
 
-    # --- формирование ряда alert_code по каждому сэмплу ---
-    ALERT_CODE = {"Тахисистолия": 1, "Гипертонус": 2, "Тетания": 3}
-    alert_code = np.zeros(n, dtype=np.int8)
+    if sev_brady_segs:
+        print("LOLL")
+        texts.append((0, "КРИТИЧНО: Тяжёлая брадикардия ≥3 мин"))
 
-    # 1) тетания (наивысший приоритет)
-    for c in tetanic:
-        s = max(0, int(round(c["start_s"] * fs)))
-        e = min(n, int(round(c["end_s"]   * fs)))
-        if e > s:
-            alert_code[s:e] = np.maximum(alert_code[s:e], ALERT_CODE["Тетания"])
+    if dec_long_crit:
+        texts.append((0, "КРИТИЧНО: Децелерация ≥3 мин"))
 
-    # 2) окна тахисистолии/гипертонуса
-    for w in windows_alerts:
-        if w["label"] is None:
-            continue
-        s = max(0, int(round(w["start_s"] * fs)))
-        e = min(n, int(round(w["end_s"]   * fs)))
-        code = ALERT_CODE[w["label"]]
-        if e > s:
-            alert_code[s:e] = np.maximum(alert_code[s:e], code)
+    for (u0, u1) in tetanic:
+        # падение ЧСС/децелер. или гипертонус в интервале тетании
+        lo = int(max(0, np.floor(u0 * fs))); hi = int(min(len(x_smooth), np.ceil(u1 * fs)))
+        fhr_drop = (hi > lo) and (np.min(x_smooth[lo:hi]) < 120.0)
+        dec_overlap = any(_overlap(u0, u1, d0, d1) for (d0, d1) in dec_segs_s)
+        if fhr_drop or dec_overlap or hyper_overlap(u0, u1):
+            texts.append((1, "КРИТИЧНО: Тетания/гипертонус + падение ЧСС/децелерации"))
+            break
 
-    # --- отрисовка (без изменений логики) ---
-    if show:
-        LINE_COLORS = {0: "#555555", 1: "#3498db", 2: "#27AE60", 3: "#1abc9c"}
-        t_abs_min = np.arange(n) / fs / 60.0
-        chunk_samples = int(round(fs * 60.0 * chunk_minutes))
+    T_total = len(x_smooth) / fs
+    win = 1200.0; step = 60.0
+    t = 0.0; seen_64 = False; seen_65_crit = False; seen_65_warn = False
+    while t < T_total:
+        w0, w1 = t, min(t + win, T_total)
+        ratio = ratio_decels_per_contr(w0, w1)
+        if ratio >= 0.5 and not seen_64 and tachysystole_recent(w1, 1800.0):
+            texts.append((1, "КРИТИЧНО: Тахисистолия (посл.30 мин) + децелерации в ≥50% схваток (20 мин)"))
+            seen_64 = True
+        if ratio >= 0.5:
+            no_rec = no_recovery_between_contractions(w0, w1)
+            long_present = any(_overlap(w0, w1, s, e) for (s, e) in dec_long_warn)
+            if (no_rec or long_present) and not seen_65_crit:
+                texts.append((2, "КРИТИЧНО: ≥50% децелераций + (нет восстановления или длительные >90 с)"))
+                seen_65_crit = True
+            elif not seen_65_warn and not (no_rec or long_present):
+                texts.append((4, "ВНИМАНИЕ: Децелерации в ≥50% схваток (20 мин)"))
+                seen_65_warn = True
+        t += step
 
-        for cs in range(0, n, chunk_samples):
-            ce = min(n, cs + chunk_samples)
-            t = t_abs_min[cs:ce]
-            fig, ax = plt.subplots(figsize=(12, 4.8))
+    # Если ничего критичного/предупреждающего не нашли:
+    if not texts:
+        return ["Норма"]
 
-            frag_s, frag_e = cs / fs, ce / fs
-            for w in windows_alerts:
-                if w["label"] is None:
-                    continue
-                w0, w1 = w["start_s"], w["end_s"]
-                ov0 = max(w0, frag_s)
-                ov1 = min(w1, frag_e)
-                if ov1 <= ov0:
-                    continue
-                span = ax.axvspan(ov0/60.0, ov1/60.0, facecolor=w["color"], alpha=alpha_bg, zorder=0)
-                if w.get("hatch"):
-                    span.set_hatch(w["hatch"])
-
-            for c in contractions:
-                if c["duration_s"] >= 120.0:
-                    s_t = max(c["start_s"], frag_s)
-                    e_t = min(c["end_s"],   frag_e)
-                    if e_t > s_t:
-                        ax.axvspan(s_t/60.0, e_t/60.0, facecolor=COLORS["Тетания"], alpha=0.25, zorder=1)
-
-            exc_seg = excess[cs:ce]
-            band = np.zeros(ce - cs, dtype=np.int8)
-            band[(exc_seg >= 10.0) & (exc_seg < 30.0)] = 1
-            band[(exc_seg >= 30.0) & (exc_seg < 80.0)] = 2
-            band[(exc_seg >= 80.0)]                     = 3
-            change = np.flatnonzero(np.diff(band)) + 1
-            bounds = [0] + change.tolist() + [ce - cs]
-            for a_rel, b_rel in zip(bounds[:-1], bounds[1:]):
-                key = int(band[a_rel])
-                ax.plot(t[a_rel:b_rel], xs[cs+a_rel:cs+b_rel], lw=1.8, color=LINE_COLORS[key], zorder=2)
-
-            ax.plot(t, tone[cs:ce], lw=1.0, ls="--", color="#9e9e9e", zorder=3)
+    texts.sort(key=lambda x: x[0])
+    # уникальные формулировки по приоритету
+    out = []
+    for _, s in texts:
+        if s not in out:
+            out.append(s)
+    return out
 
 
+def _max_run_len(mask01: np.ndarray, fs: float) -> float:
+    """Максимальная длина непрерывного участка (сек) в 0/1 маске."""
+    max_len = 0
+    cur = 0
+    for v in mask01:
+        if v:
+            cur += 1
+            max_len = max(max_len, cur)
+        else:
+            cur = 0
+    return max_len / fs
 
+def _share_on(mask01: np.ndarray) -> float:
+    return float(np.mean(mask01.astype(bool)))
 
-            proxies = [
-                Patch(facecolor=COLORS["Тахисистолия"], alpha=alpha_bg, label="Тахисистолия (>5/10 мин)"),
-                Patch(facecolor=COLORS["Гипертонус"],   alpha=alpha_bg, label="Гипертонус (tone_med > 25)", hatch="////"),
-                Patch(facecolor=COLORS["Тетания"],      alpha=0.25,       label="Тетаническая (≥120 с)"),
-                Line2D([0],[0], color=LINE_COLORS[1], lw=2, label="Интенсивность 10–30"),
-                Line2D([0],[0], color=LINE_COLORS[2], lw=2, label="Интенсивность 30–80"),
-                Line2D([0],[0], color=LINE_COLORS[3], lw=2, label="Интенсивность ≥80"),
-            ]
-            ax.legend(handles=proxies, loc="upper left", ncol=2, framealpha=0.95)
-
-            ax.set_title(f"Токограмма")
-            ax.set_xlabel("Время, мин"); ax.set_ylabel("Маточные сокращения, мм рт. ст.")
-            ax.grid(True, alpha=0.25)
-            plt.show()
-
-    return tone, intensity_mmHg, alert_code, contractions, windows_alerts, stats_alerts
+def _long_events_share(event_code: np.ndarray, fs: float, *, sign: int, min_s: float) -> bool:
+    """Есть ли события указанного знака длительностью более min_s секунд."""
+    assert sign in (-1, 1)
+    m = (event_code == sign).astype(int)
+    return _max_run_len(m, fs) >= min_s

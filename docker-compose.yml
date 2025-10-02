@@ -9,10 +9,3 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
-    volumes:
-      # Монтируем данные пациентов (только чтение)
-      - ./hypoxia:/app/hypoxia:ro
-      - ./regular:/app/regular:ro
-      # Если хочешь, чтобы код обновлялся без пересборки образа —
-      # раскомментируй строку ниже:
-      # - ./api_server.py:/app/api_server.py:ro
